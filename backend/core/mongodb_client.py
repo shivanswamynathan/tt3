@@ -12,16 +12,11 @@ class MongoDBClient:
     
     Manages connections and operations for both content data and revision sessions,
     including topic management, session persistence, and student progress tracking.
-    
-    Example:
-        client = MongoDBClient()
-        topics = client.get_available_topics()
-        session = client.get_revision_session("session_123")
     """
     def __init__(self):
         self.client = MongoClient(Config.MONGODB_URI)
         self.db = self.client[Config.DATABASE_NAME]
-        self.collection = self.db[Config.COLLECTION_NAME]
+        self.collection = self.db[Config.COLLECTION_NAME]  # Updated collection name
         self.revision_collection = self.db[Config.REVISION_COLLECTION]  
         self._ensure_text_index()
     
@@ -33,8 +28,8 @@ class MongoDBClient:
             has_text_index = any("text" in str(index.get("key", {})) for index in indexes)
             
             if not has_text_index:
-                self.collection.create_index([("text", "text")])
-                logger.info("Created text index on 'text' field")
+                self.collection.create_index([("content", "text")])
+                logger.info("Created text index on 'content' field")
         except Exception as e:
             logger.warning(f"Could not create text index: {e}")
     
@@ -42,44 +37,52 @@ class MongoDBClient:
         """
         Fetch all available topics with metadata from MongoDB.
         
-        Retrieves distinct topics from the content collection and enriches them
-        with chunk counts, display names, and configuration details like max
-        conversations and completion thresholds for the revision system.
-        
         Returns:
             List[Dict[str, Any]]: List of topic dictionaries containing:
                 - topic: Full topic name for searches
                 - display_name: Shortened name for UI display
-                - chunk_count: Number of content sections available
+                - chunk_count: Number of subtopics available
                 - description: Human-readable topic description
                 - max_conversations: Maximum allowed interactions
                 - completion_threshold: Score needed to complete topic
-                
-        Returns:
-            List: Empty list if database error occurs
         """
         try:
-            # Get distinct topics
-            topics = self.collection.distinct("topic")
+            # Get distinct chapters and topics
+            pipeline = [
+                {"$group": {
+                    "_id": {
+                        "chapter": "$chapter",
+                        "topic_title": "$topic_title"
+                    },
+                    "subtopic_count": {"$sum": {"$size": "$subtopics"}},
+                    "topic_number": {"$first": "$topic_number"}
+                }}
+            ]
             
-            # Get topic details with counts
+            topics_data = list(self.collection.aggregate(pipeline))
+            
             topic_details = []
-            for topic in topics:
-                count = self.collection.count_documents({"topic": topic})
+            for topic_data in topics_data:
+                chapter = topic_data["_id"]["chapter"]
+                topic_title = topic_data["_id"]["topic_title"]
+                subtopic_count = topic_data["subtopic_count"]
+                topic_number = topic_data["topic_number"]
                 
-                # Create shorter display name
-                short_name = topic.split(':')[0] if ':' in topic else topic
-                short_name = short_name.replace("Exploring the Role of", "").strip()
+                # Create full topic identifier
+                full_topic = f"{chapter} - Topic {topic_number}: {topic_title}"
                 
-                topic_config = Config.get_topic_config(topic)
+                topic_config = Config.get_topic_config(full_topic)
                 
                 topic_details.append({
-                    "topic": topic,  
-                    "display_name": short_name,  
-                    "chunk_count": count,
-                    "description": f"Study material with {count} content sections",
+                    "topic": full_topic,  
+                    "display_name": topic_title,  
+                    "chunk_count": subtopic_count,
+                    "description": f"Chapter: {chapter} | {subtopic_count} subtopics",
                     "max_conversations": topic_config["max_conversations"],
-                    "completion_threshold": topic_config["completion_threshold"]
+                    "completion_threshold": topic_config["completion_threshold"],
+                    "chapter": chapter,
+                    "topic_number": topic_number,
+                    "topic_title": topic_title
                 })
             
             return topic_details
@@ -87,57 +90,86 @@ class MongoDBClient:
             logger.error(f"Error fetching topics: {e}")
             return []
     
-    def get_topic_content(self, topic: str, limit: int = 10) -> List[Dict[str, Any]]:
+    def get_topic_subtopics(self, topic_title: str) -> List[Dict[str, Any]]:
         """
-        Get content chunks for a specific topic.
-        
-        Retrieves text content chunks that match the given topic using case-insensitive
-        regex matching. Returns limited number of chunks for performance optimization
-        during revision sessions and content delivery.
+        Get all subtopics for a specific topic.
         
         Args:
-            topic (str): Topic name to search for (supports partial matching)
-            limit (int): Maximum number of content chunks to return (default: 10)
+            topic_title (str): The topic title to search for
             
         Returns:
-            List[Dict[str, Any]]: List of content chunks containing:
-                - text: The actual content text
-                - id: Unique chunk identifier
-                - topic: Full topic name
-                
-        Returns:
-            List: Empty list if topic not found or database error occurs
+            List[Dict[str, Any]]: List of subtopics with content
         """
         try:
-            cursor = self.collection.find(
-                {"topic": {"$regex": topic, "$options": "i"}},
-                {"text": 1, "id": 1, "topic": 1, "_id": 0}
-            ).limit(limit)
+            # Find the document with matching topic_title
+            document = self.collection.find_one({"topic_title": topic_title})
             
-            return list(cursor)
+            if document and "subtopics" in document:
+                return document["subtopics"]
+            
+            return []
+        except Exception as e:
+            logger.error(f"Error fetching subtopics for {topic_title}: {e}")
+            return []
+    
+    def get_subtopic_content(self, topic_title: str, subtopic_number: str) -> Dict[str, Any]:
+        """
+        Get specific subtopic content.
+        
+        Args:
+            topic_title (str): The topic title
+            subtopic_number (str): Subtopic number (e.g., "3.1")
+            
+        Returns:
+            Dict[str, Any]: Subtopic data or empty dict if not found
+        """
+        try:
+            document = self.collection.find_one({"topic_title": topic_title})
+            
+            if document and "subtopics" in document:
+                for subtopic in document["subtopics"]:
+                    if subtopic["subtopic_number"] == subtopic_number:
+                        return subtopic
+            
+            return {}
+        except Exception as e:
+            logger.error(f"Error fetching subtopic {subtopic_number} for {topic_title}: {e}")
+            return {}
+
+    def get_topic_content(self, topic: str, limit: int = 10) -> List[Dict[str, Any]]:
+        """
+        Get content chunks for a specific topic (backward compatibility).
+        
+        Args:
+            topic (str): Topic name to search for
+            limit (int): Maximum number of content chunks to return
+            
+        Returns:
+            List[Dict[str, Any]]: List of content chunks
+        """
+        try:
+            # Extract topic_title from full topic string
+            topic_title = topic.split(": ")[-1] if ": " in topic else topic
+            
+            subtopics = self.get_topic_subtopics(topic_title)
+            
+            # Convert subtopics to old format for compatibility
+            content_chunks = []
+            for subtopic in subtopics[:limit]:
+                content_chunks.append({
+                    "text": subtopic["content"],
+                    "id": subtopic["subtopic_number"],
+                    "topic": topic,
+                    "subtopic_title": subtopic["subtopic_title"]
+                })
+            
+            return content_chunks
         except Exception as e:
             logger.error(f"Error fetching topic content: {e}")
             return []
     
     def save_revision_session(self, session_data: Dict[str, Any]) -> bool:
-        """
-        Save or update revision session in MongoDB.
-        
-        Persists complete session data including conversation history, progress,
-        and metadata. Uses upsert operation to either create new session or
-        update existing one based on session_id. Automatically adds timestamp.
-        
-        Args:
-            session_data (Dict[str, Any]): Complete session data including:
-                - session_id: Unique session identifier
-                - student_id: Student identifier
-                - topic: Topic being studied
-                - conversation_history: List of interactions
-                - is_complete: Session completion status
-                
-        Returns:
-            bool: True if save successful, False if database error occurs
-        """
+        """Save or update revision session in MongoDB."""
         try:
             session_data["updated_at"] = datetime.now()
             
@@ -154,20 +186,7 @@ class MongoDBClient:
             return False
     
     def get_revision_session(self, session_id: str) -> Optional[Dict[str, Any]]:
-        """
-        Get revision session by session_id.
-        
-        Retrieves complete session data for continuing existing revision sessions.
-        Excludes MongoDB's internal _id field from results for cleaner data handling.
-        Essential for maintaining conversation context across interactions.
-        
-        Args:
-            session_id (str): Unique session identifier
-            
-        Returns:
-            Optional[Dict[str, Any]]: Session data if found, None if not found or error
-                Contains all session fields like conversation_history, progress, etc.
-        """
+        """Get revision session by session_id."""
         try:
             session = self.revision_collection.find_one(
                 {"session_id": session_id},
@@ -179,24 +198,7 @@ class MongoDBClient:
             return None
     
     def get_student_revision_history(self, student_id: str, limit: int = 20) -> List[Dict[str, Any]]:
-        """
-        Get revision history for a student.
-        
-        Retrieves student's past revision sessions sorted by most recent first.
-        Useful for tracking learning progress, identifying patterns, and providing
-        personalized recommendations based on revision history.
-        
-        Args:
-            student_id (str): Student identifier
-            limit (int): Maximum number of sessions to return (default: 20)
-            
-        Returns:
-            List[Dict[str, Any]]: List of session data sorted by started_at (newest first)
-                Each session contains topic, completion status, interaction count, etc.
-                
-        Returns:
-            List: Empty list if no history found or database error occurs
-        """
+        """Get revision history for a student."""
         try:
             cursor = self.revision_collection.find(
                 {"student_id": student_id},
@@ -209,12 +211,7 @@ class MongoDBClient:
             return []
     
     def get_topic_revision_stats(self, topic: str) -> Dict[str, Any]:
-        """ Get statistics for topic revisions.
-        
-        Calculates comprehensive analytics for a topic including total sessions,
-        completion rates, and average interaction counts. Used for topic difficulty
-        assessment and system optimization insights.
-        """
+        """Get statistics for topic revisions."""
         try:
             total_sessions = self.revision_collection.count_documents({"topic": topic})
             completed_sessions = self.revision_collection.count_documents({
@@ -242,12 +239,7 @@ class MongoDBClient:
             return {}
     
     def save_conversation_turn(self, session_id: str, turn_data: Dict[str, Any]) -> bool:
-        """Save a conversation turn to the session.
-        
-        Appends a single interaction (user query + AI response) to the session's
-        conversation history. Maintains chronological order of all interactions
-        and updates session timestamp for accurate tracking.
-        """
+        """Save a conversation turn to the session."""
         try:
             result = self.revision_collection.update_one(
                 {"session_id": session_id},
@@ -263,24 +255,7 @@ class MongoDBClient:
             return False
     
     def update_session_progress(self, session_id: str, progress_data: Dict[str, Any]) -> bool:
-        """
-        Update session progress.
-        
-        Updates session-level progress indicators like conversation count,
-        completion status, current learning stage, or performance scores.
-        Automatically updates timestamp to track when progress was last modified.
-        
-        Args:
-            session_id (str): Session to update
-            progress_data (Dict[str, Any]): Progress updates such as:
-                - conversation_count: Number of interactions
-                - is_complete: Whether session finished
-                - current_stage: Learning phase (revision, assessment, etc.)
-                - performance_score: Student's current score
-                
-        Returns:
-            bool: True if update successful, False if session not found or error
-        """
+        """Update session progress."""
         try:
             progress_data["updated_at"] = datetime.now()
             
