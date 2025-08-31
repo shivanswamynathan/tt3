@@ -14,7 +14,7 @@ class Config:
     # MongoDB Settings
     MONGODB_URI: str = "mongodb+srv://haswath1810:haswath18@cluster0.tkjt0ke.mongodb.net/?retryWrites=true&w=majority"
     DATABASE_NAME: str = "ncert_class8"
-    COLLECTION_NAME: str = "science"
+    COLLECTION_NAME: str = "test"
     REVISION_COLLECTION: str = "revision_sessions" 
     
     # Dynamic Defaults (calculated per topic)
